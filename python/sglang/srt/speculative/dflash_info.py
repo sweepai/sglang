@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+import os
 from typing import List, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+
+logger = logging.getLogger(__name__)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
@@ -17,6 +21,10 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+DFLASH_DEBUG = bool(os.environ.get("DFLASH_DEBUG", "0") == "1")
+ITER = 0
+MAX_ITER = 0
 
 
 @dataclass
@@ -289,6 +297,8 @@ class DFlashVerifyInput(SpecInput):
             next_target_hidden: tensor [sum(commit_lens), feature_dim]
             accept_length_per_req_cpu: list[int] (accepted draft tokens per request)
         """
+        global ITER
+        ITER += 1
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
             return empty, empty.to(torch.int32), empty, []
@@ -300,10 +310,48 @@ class DFlashVerifyInput(SpecInput):
         target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
             bs, self.draft_token_num
         )
+
+        if DFLASH_DEBUG:
+            # Debug: print shapes to verify we have logits for all draft positions
+            print(f"[DFLASH DEBUG ITER={ITER}] bs={bs}, draft_token_num={self.draft_token_num}")
+            print(f"[DFLASH DEBUG ITER={ITER}] next_token_logits.shape={logits_output.next_token_logits.shape}")
+            print(f"[DFLASH DEBUG ITER={ITER}] expected shape: [{bs * self.draft_token_num}, vocab_size]")
+            print(f"[DFLASH DEBUG ITER={ITER}] candidates.shape={candidates.shape}")
+            print(f"[DFLASH DEBUG ITER={ITER}] positions={self.positions.tolist()}")
+            print(f"[DFLASH DEBUG ITER={ITER}] draft_token (input_ids)={self.draft_token.tolist()}")
+
+            # Show position-by-position comparison
+            print(f"[DFLASH VERIFY DEBUG] Position-by-position analysis:")
+            positions_list = self.positions.view(bs, self.draft_token_num)[0].tolist()
+            cand = candidates[0].tolist()
+            tgt = target_predict[0].tolist()
+            for idx in range(min(8, self.draft_token_num)):  # First 8 positions
+                pos = positions_list[idx]
+                print(f"  idx={idx} pos={pos}: candidate={cand[idx]}, target_predict={tgt[idx]}, match={cand[idx]==tgt[idx]}")
+
+            # Debug: print token comparison
+            for i in range(bs):
+                req = batch.reqs[i]
+                input_len = len(req.origin_input_ids)
+                output_len = len(req.output_ids) if req.output_ids else 0
+                seq_pos = input_len + output_len  # current position in the full sequence
+                draft = candidates[i].tolist()
+                target = req.output_ids[-5:] + target_predict[i].tolist()
+                matches = [d == t for d, t in zip(draft, target)]
+                print(f"[DFLASH DEBUG ITER={ITER}] req={i} seq_pos={seq_pos} (input_len={input_len}, output_len={output_len})")
+                print(f"  input:  {req.origin_input_ids[:10]}...{req.origin_input_ids[-10:]}")
+                print(f"  draft:  {draft}")
+                print(f"  target: {target}")
+                print(f"  match:  {matches}")
+            
         accept_len, bonus = compute_dflash_accept_len_and_bonus(
             candidates=candidates,
             target_predict=target_predict,
         )
+
+        if DFLASH_DEBUG:
+            print(f"[DFLASH DEBUG ITER={ITER}] accept_len={accept_len.tolist()}")
+            print(f"[DFLASH DEBUG ITER={ITER}] bonus={bonus.tolist()}")
 
         # Build output tokens on GPU: accepted drafts + bonus token.
         out_lens = accept_len.to(torch.int32) + 1
@@ -394,6 +442,17 @@ class DFlashVerifyInput(SpecInput):
                 raise RuntimeError("DFLASH verify unexpectedly appended 0 tokens.")
             commit_lens_cpu.append(appended)
             new_verified_cpu.append(req.output_ids[-1])
+
+            if DFLASH_DEBUG:
+                print(f"[DFLASH DEBUG ITER={ITER}] req={i} proposed={proposed} appended={appended}")
+                print(f"[DFLASH DEBUG ITER={ITER}] req={i} output_ids (last 20)={req.output_ids[-20:]}")
+                # Show where each token goes
+                input_len = len(req.origin_input_ids)
+                output_len_before = len(req.output_ids) - appended
+                print(f"[DFLASH POSITION DEBUG] Tokens added to positions:")
+                for j, tok in enumerate(proposed[:min(5, len(proposed))]):
+                    pos = input_len + output_len_before + j
+                    print(f"  token {tok} -> position {pos}")
             accept_length_per_req_cpu.append(max(0, appended - 1))
 
             req.spec_verify_ct += 1
@@ -459,6 +518,9 @@ class DFlashVerifyInput(SpecInput):
         new_verified_id = torch.tensor(
             new_verified_cpu, dtype=torch.int64, device=device
         )
+        if DFLASH_DEBUG and ITER >= MAX_ITER:
+                raise KeyboardInterrupt("STOP")
+
         return (
             new_verified_id,
             commit_lens,

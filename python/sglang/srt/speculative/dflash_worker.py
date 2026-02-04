@@ -1,10 +1,16 @@
+import collections
 import logging
+import os
+import time
 from copy import deepcopy
 from typing import Optional, Union
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
+
+# Global accept length tracking
+ACCEPT_COUNTER = collections.defaultdict(int)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -19,6 +25,8 @@ from sglang.srt.speculative.dflash_utils import resolve_dflash_mask_token
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
+
+DFLASH_DEBUG = bool(os.environ.get("DFLASH_DEBUG", "0") == "1")
 logger = logging.getLogger(__name__)
 
 
@@ -48,7 +56,6 @@ class DFlashWorker:
         self.device = target_worker.device
 
         self._warned_forced_greedy = False
-        self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
@@ -316,6 +323,40 @@ class DFlashWorker:
         torch.add(prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
         positions = positions_2d.reshape(-1)
 
+        if DFLASH_DEBUG:
+            # Debug: trace position/token alignment
+            print(f"[DFLASH ANCHOR DEBUG] seq_lens (prefix_lens) = {prefix_lens.tolist()}")
+            print(f"[DFLASH ANCHOR DEBUG] verified_id = {draft_input.verified_id.tolist()}")
+            print(f"[DFLASH ANCHOR DEBUG] positions for draft block = {positions_2d[0].tolist()}")
+            print(f"[DFLASH ANCHOR DEBUG] block_ids[0] (anchor) = {block_ids[0, 0].item()}")
+            # Show what tokens are at positions around prefix_lens
+            for i, req in enumerate(batch.reqs):
+                pl = int(prefix_lens[i].item())
+                input_len = len(req.origin_input_ids)
+                output_len = len(req.output_ids) if req.output_ids else 0
+                print(f"[DFLASH ANCHOR DEBUG] req {i}: input_len={input_len}, output_len={output_len}, prefix_len={pl}")
+                # Token at position pl-1 (should be verified_id)
+                if pl - 1 < input_len:
+                    tok_at_pl_minus_1 = req.origin_input_ids[pl - 1]
+                else:
+                    tok_at_pl_minus_1 = req.output_ids[pl - 1 - input_len] if (pl - 1 - input_len) < output_len else "N/A"
+                # Token at position pl (if we have it)
+                if pl < input_len:
+                    tok_at_pl = req.origin_input_ids[pl]
+                elif pl - input_len < output_len:
+                    tok_at_pl = req.output_ids[pl - input_len]
+                else:
+                    tok_at_pl = "N/A (to be predicted)"
+                print(f"[DFLASH ANCHOR DEBUG]   token at pos {pl-1} = {tok_at_pl_minus_1}")
+                print(f"[DFLASH ANCHOR DEBUG]   token at pos {pl} = {tok_at_pl}")
+                print(f"[DFLASH ANCHOR DEBUG]   verified_id = {draft_input.verified_id[i].item()}")
+                print(f"[DFLASH ANCHOR DEBUG]   anchor used = {block_ids[i, 0].item()}")
+            print(f"[DFLASH DEBUG] noise_embedding (last 5 positions):")
+            for i in range(max(0, self.block_size - 5), self.block_size):
+                h = noise_embedding[0, i]
+                print(f"  noise pos {i}: mean={h.mean().item():.6f}, std={h.std().item():.6f}, first5={h[:5].tolist()}")
+
+        # block_start/block_end use original prefix_lens for KV cache allocation
         block_start = prefix_lens
         block_end = self._draft_block_end_buf[:bs]
         torch.add(block_start, int(self.block_size), out=block_end)
@@ -673,6 +714,24 @@ class DFlashWorker:
             ctx_hidden = self.draft_model.project_target_hidden(
                 draft_input.target_hidden
             )  # [sum(ctx), hidden]
+
+            if DFLASH_DEBUG:
+                # Debug ctx_positions (last 5) - equivalent to training's position_ids[:, ctx_end-5:ctx_end]
+                print(f"[DFLASH KV DEBUG] ctx_positions (last 5): {ctx_positions[-5:].tolist()}")
+
+                # Debug raw target_hidden BEFORE fc projection
+                raw_th = draft_input.target_hidden
+                print(f"[DFLASH KV DEBUG] raw target_hidden shape={raw_th.shape}")
+                for i in range(max(0, raw_th.shape[0] - 5), raw_th.shape[0]):
+                    h = raw_th[i]
+                    print(f"  raw target_hidden pos {i}: mean={h.mean().item():.6f}, std={h.std().item():.6f}, first5={h[:5].tolist()}")
+
+                # Per-position ctx_hidden stats (after fc, no norm)
+                print(f"[DFLASH KV DEBUG] ctx_hidden per-position (last 5):")
+                for i in range(max(0, ctx_hidden.shape[0] - 5), ctx_hidden.shape[0]):
+                    h = ctx_hidden[i]
+                    print(f"  ctx pos {i}: mean={h.mean().item():.6f}, std={h.std().item():.6f}, first5={h[:5].tolist()}")
+
             if ctx_hidden.shape[0] != ctx_cache_loc.numel():
                 raise RuntimeError(
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
@@ -776,12 +835,32 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        # Time the draft phase
+        torch.cuda.synchronize()
+        t_draft_start = time.perf_counter()
+
         self._prepare_for_speculative_decoding(batch, draft_input)
+
+        torch.cuda.synchronize()
+        t_draft_end = time.perf_counter()
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
+
+        # Time the target verify phase
+        t_target_start = time.perf_counter()
+
+        if DFLASH_DEBUG:
+            # Debug: print target verify batch state
+            print(f"[DFLASH TARGET DEBUG] forward_mode={model_worker_batch.forward_mode}")
+            print(f"[DFLASH TARGET DEBUG] seq_lens={model_worker_batch.seq_lens.tolist()}")
+            print(f"[DFLASH TARGET DEBUG] input_ids shape={model_worker_batch.input_ids.shape}")
+            print(f"[DFLASH TARGET DEBUG] attn_backend={type(self.model_runner.attn_backend).__name__}")
+            print(f"[DFLASH TARGET DEBUG] dflash block_size={self.block_size}")
+            print(f"[DFLASH TARGET DEBUG] server_args.speculative_num_draft_tokens={self.server_args.speculative_num_draft_tokens}")
+            print(f"[DFLASH TARGET DEBUG] backend speculative_num_draft_tokens={self.model_runner.attn_backend.speculative_num_draft_tokens}")
 
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
@@ -790,6 +869,12 @@ class DFlashWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+
+        torch.cuda.synchronize()
+        t_target_end = time.perf_counter()
+
+        # Time the acceptance calculation
+        t_accept_start = time.perf_counter()
 
         (
             new_verified_id,
@@ -802,8 +887,13 @@ class DFlashWorker:
             page_size=self.page_size,
         )
 
+        torch.cuda.synchronize()
+        t_accept_end = time.perf_counter()
+
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
+        t_kv_start = time.perf_counter()
+
         draft_input.verified_id = new_verified_id
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
@@ -811,13 +901,54 @@ class DFlashWorker:
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
+        torch.cuda.synchronize()
+        t_kv_end = time.perf_counter()
+
         num_accepted_tokens = sum(accept_length_per_req_cpu)
-        if not self._logged_first_verify and self.tp_rank == 0:
+
+        # Calculate timing stats
+        draft_ms = (t_draft_end - t_draft_start) * 1000
+        target_ms = (t_target_end - t_target_start) * 1000
+        accept_ms = (t_accept_end - t_accept_start) * 1000
+        kv_append_ms = (t_kv_end - t_kv_start) * 1000
+        total_ms = (t_kv_end - t_draft_start) * 1000
+        overhead_ms = draft_ms + accept_ms + kv_append_ms
+
+        # Track accept lengths globally
+        if self.tp_rank == 0:
+            for acc_len in accept_length_per_req_cpu:
+                ACCEPT_COUNTER[acc_len] += 1
+
+            # Calculate and log stats
+            total_count = sum(ACCEPT_COUNTER.values())
+            total_len = sum(k * v for k, v in ACCEPT_COUNTER.items())
+            mean_accept = total_len / total_count if total_count > 0 else 0
+
             logger.info(
-                "DFLASH verify completed. accept_length_per_req=%s",
-                accept_length_per_req_cpu,
+                f"[DFLASH VERIFY] accept_lens={accept_length_per_req_cpu}, "
+                f"mean={sum(accept_length_per_req_cpu)/len(accept_length_per_req_cpu):.2f}, "
+                f"overall_mean={mean_accept:.2f}"
             )
-            self._logged_first_verify = True
+            logger.info(
+                f"[DFLASH STATS] " + ", ".join(f"{k}: {v}" for k, v in sorted(ACCEPT_COUNTER.items()))
+            )
+
+            # Log cumulative distribution (% of requests with accept_len >= k)
+            cumsum = {}
+            cumsum_count = 0
+            for k, v in sorted(ACCEPT_COUNTER.items(), reverse=True):
+                cumsum_count += v
+                cumsum[k] = cumsum_count
+            logger.info(
+                f"[DFLASH CDF] " + ", ".join(
+                    f">={k}: {(v/total_count):.1%}" for k, v in sorted(cumsum.items()) if k > 0
+                )
+            )
+            logger.info(
+                f"[DFLASH TIMING] draft={draft_ms:.2f}ms, target={target_ms:.2f}ms, "
+                f"accept={accept_ms:.2f}ms, kv_append={kv_append_ms:.2f}ms, "
+                f"total={total_ms:.2f}ms, overhead={overhead_ms:.2f}ms ({overhead_ms/total_ms*100:.1f}%)"
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output,

@@ -1,3 +1,4 @@
+import collections
 import logging
 from typing import List, Optional
 
@@ -6,6 +7,9 @@ import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
+
+# Global accept length tracking
+ACCEPT_COUNTER = collections.defaultdict(int)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -230,6 +234,38 @@ class NGRAMWorker:
             )
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
+
+            # Track accept lengths globally
+            if self.tp_rank == 0:
+                for acc_len in accept_lens:
+                    ACCEPT_COUNTER[int(acc_len)] += 1
+
+                # Calculate and log stats
+                total_count = sum(ACCEPT_COUNTER.values())
+                total_len = sum(k * v for k, v in ACCEPT_COUNTER.items())
+                mean_accept = total_len / total_count if total_count > 0 else 0
+
+                logger.info(
+                    f"[NGRAM VERIFY] accept_lens={accept_lens}, "
+                    f"mean={sum(accept_lens)/len(accept_lens):.2f}, "
+                    f"overall_mean={mean_accept:.2f}"
+                )
+                logger.info(
+                    f"[NGRAM STATS] " + ", ".join(f"{k}: {v}" for k, v in sorted(ACCEPT_COUNTER.items()))
+                )
+
+                # Log cumulative distribution (% of requests with accept_len >= k)
+                cumsum = {}
+                cumsum_count = 0
+                for k, v in sorted(ACCEPT_COUNTER.items(), reverse=True):
+                    cumsum_count += v
+                    cumsum[k] = cumsum_count
+                logger.info(
+                    f"[NGRAM CDF] " + ", ".join(
+                        f">={k}: {(v/total_count):.1%}" for k, v in sorted(cumsum.items()) if k > 0
+                    )
+                )
+
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
